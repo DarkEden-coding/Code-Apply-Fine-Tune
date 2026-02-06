@@ -1,0 +1,6 @@
+requests
+gitpython
+datasets
+unsloth[colab-new]
+trl
+tqdm
