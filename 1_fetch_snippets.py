@@ -3,6 +3,7 @@ Fetch high-quality GitHub repos and extract code snippets.
 Outputs: data/snippets.jsonl
 """
 
+import argparse
 import json
 import random
 import re
@@ -29,11 +30,14 @@ from config import (
 )
 
 
-def search_repos(language: str, per_page: int = 10) -> list[dict]:
+def search_repos(
+    language: str, per_page: int = 10, github_token: str | None = None
+) -> list[dict]:
     """Search GitHub for top-starred repos in a language."""
     headers = {"Accept": "application/vnd.github+json"}
-    if GITHUB_TOKEN:
-        headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    token = github_token or GITHUB_TOKEN
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
 
     url = "https://api.github.com/search/repositories"
     params = {
@@ -155,15 +159,36 @@ def collect_files(repo_dir: Path) -> list[Path]:
     return files[:MAX_FILES_PER_REPO]
 
 
+def read_token_from_file(token_path: Path) -> str | None:
+    if not token_path.is_file():
+        return None
+    token = token_path.read_text(encoding="utf-8").strip()
+    return token or None
+
+
 def main():
+    parser = argparse.ArgumentParser(
+        description="Fetch GitHub snippets using an optional token file."
+    )
+    parser.add_argument(
+        "--token-file",
+        type=Path,
+        default=Path("key.txt"),
+        help="Path to a file containing the GitHub token",
+    )
+    args = parser.parse_args()
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     REPOS_DIR.mkdir(parents=True, exist_ok=True)
+    github_token = read_token_from_file(args.token_file) or GITHUB_TOKEN
 
     # --- gather repo metadata ---
     all_repos = []
     for lang in GITHUB_LANGUAGES:
         print(f"Searching GitHub for {lang} repos...")
-        repos = search_repos(lang, per_page=REPOS_PER_LANGUAGE)
+        repos = search_repos(
+            lang, per_page=REPOS_PER_LANGUAGE, github_token=github_token
+        )
         for r in repos:
             all_repos.append(
                 {

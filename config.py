@@ -21,7 +21,7 @@ MAX_REPOS = 20
 MIN_SNIPPET_LINES = 6
 MAX_SNIPPET_LINES = 60
 MAX_SNIPPETS_PER_FILE = 3
-MAX_FILES_PER_REPO = 50
+MAX_FILES_PER_REPO = 100
 FILE_EXTENSIONS = {
     ".py",
     ".go",
@@ -50,7 +50,7 @@ OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_MODEL = "granite4:3b-h"
 
 # ---------- fine-tuning ----------
-BASE_MODEL = "unsloth/gemma-2-2b-it-bnb-4bit"
+BASE_MODEL = "unsloth/gemma-3-4b-it-unsloth-bnb-4bit"
 OUTPUT_DIR = DATA_DIR / "finetuned"
 LORA_R = 16
 LORA_ALPHA = 32

@@ -12,11 +12,12 @@ Common options:
 """
 
 import json
+import os
+import sys
 from pathlib import Path
 
+import torch
 from datasets import Dataset
-from trl import SFTTrainer, SFTConfig
-from unsloth import FastLanguageModel
 
 from config import (
     BASE_MODEL,
@@ -53,36 +54,138 @@ def format_chat(sample: dict) -> str:
     )
 
 
+def ensure_cuda_ready() -> None:
+    """
+    Fail fast with a clear message when PyTorch cannot access CUDA.
+    Unsloth requires a CUDA-capable torch build + visible GPU.
+    """
+    if torch.cuda.is_available():
+        return
+
+    hints = [
+        f"torch.__version__={torch.__version__}",
+        f"torch.version.cuda={torch.version.cuda}",
+    ]
+
+    if "+cpu" in torch.__version__ or torch.version.cuda is None:
+        hints.append(
+            "Detected a CPU-only PyTorch build. Install a CUDA build of torch first "
+            "(example: uv pip install --upgrade torch torchvision torchaudio "
+            "--index-url https://download.pytorch.org/whl/cu128)."
+        )
+    else:
+        hints.append(
+            "CUDA build is installed but no GPU is visible to PyTorch. "
+            "Check NVIDIA driver, CUDA runtime compatibility, and that this process is not GPU-restricted."
+        )
+
+    raise RuntimeError(
+        "CUDA is not available, so Unsloth cannot run.\n"
+        + "\n".join(f"- {h}" for h in hints)
+    )
+
+
+def ensure_unsloth_cache_on_path() -> None:
+    """
+    Ensure Windows subprocess workers can import Unsloth's compiled trainer module.
+    """
+    cache_dir = Path(__file__).resolve().parent / "unsloth_compiled_cache"
+    if not cache_dir.exists():
+        return
+
+    cache_str = str(cache_dir)
+    if cache_str not in sys.path:
+        sys.path.insert(0, cache_str)
+
+    existing = os.environ.get("PYTHONPATH", "")
+    if cache_str not in existing.split(os.pathsep):
+        os.environ["PYTHONPATH"] = (
+            cache_str if not existing else f"{cache_str}{os.pathsep}{existing}"
+        )
+
+
 def main():
+    ensure_cuda_ready()
+    ensure_unsloth_cache_on_path()
+
+    # Avoid TorchInductor compile instability on some Windows + CUDA stacks.
+    try:
+        import torch._dynamo
+
+        torch._dynamo.config.suppress_errors = True
+        torch._dynamo.config.disable = True
+    except Exception:
+        pass
+
+    # Unsloth should be imported before trl/transformers/peft.
+    import unsloth  # noqa: F401
+    from trl import SFTConfig, SFTTrainer
+    from unsloth import FastLanguageModel, FastModel
+
+    use_bf16 = torch.cuda.is_bf16_supported()
+    gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+
+    effective_max_seq_len = MAX_SEQ_LEN
+    effective_batch_size = BATCH_SIZE
+    if gpu_mem_gb <= 8:
+        # 8GB cards are very tight for Gemma-3 4B QLoRA at 4k context.
+        effective_max_seq_len = min(MAX_SEQ_LEN, 2048)
+        effective_batch_size = min(BATCH_SIZE, 1)
+
     print(f"Base model:  {BASE_MODEL}")
     print(f"Train file:  {TRAIN_FILE}")
     print(f"Eval file:   {EVAL_FILE}")
     print(f"Output dir:  {OUTPUT_DIR}\n")
+    print(f"GPU memory:  {gpu_mem_gb:.2f} GB")
+    print(f"Batch size:  {effective_batch_size}")
+    print(f"Max seq len: {effective_max_seq_len}\n")
 
     # --- load model ---
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=BASE_MODEL,
-        max_seq_length=MAX_SEQ_LEN,
-        load_in_4bit=True,
-    )
+    if "gemma-3" in BASE_MODEL.lower():
+        model, tokenizer = FastModel.from_pretrained(
+            model_name=BASE_MODEL,
+            max_seq_length=effective_max_seq_len,
+            load_in_4bit=True,
+            load_in_8bit=False,
+            full_finetuning=False,
+        )
 
-    model = FastLanguageModel.get_peft_model(
-        model,
-        r=LORA_R,
-        lora_alpha=LORA_ALPHA,
-        lora_dropout=0.05,
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
-        bias="none",
-        use_gradient_checkpointing="unsloth",
-    )
+        model = FastModel.get_peft_model(
+            model,
+            finetune_vision_layers=False,
+            finetune_language_layers=True,
+            finetune_attention_modules=True,
+            finetune_mlp_modules=True,
+            r=LORA_R,
+            lora_alpha=LORA_ALPHA,
+            lora_dropout=0,
+            bias="none",
+            random_state=42,
+        )
+    else:
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=BASE_MODEL,
+            max_seq_length=effective_max_seq_len,
+            load_in_4bit=True,
+        )
+
+        model = FastLanguageModel.get_peft_model(
+            model,
+            r=LORA_R,
+            lora_alpha=LORA_ALPHA,
+            lora_dropout=0,
+            target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+            bias="none",
+            use_gradient_checkpointing="unsloth",
+        )
 
     # --- load data ---
     train_raw = load_jsonl(TRAIN_FILE)
@@ -104,11 +207,12 @@ def main():
         eval_dataset=eval_ds,
         args=SFTConfig(
             output_dir=str(OUTPUT_DIR),
-            per_device_train_batch_size=BATCH_SIZE,
+            per_device_train_batch_size=effective_batch_size,
             gradient_accumulation_steps=GRAD_ACCUM,
             num_train_epochs=EPOCHS,
             learning_rate=LR,
-            fp16=True,
+            fp16=not use_bf16,
+            bf16=use_bf16,
             logging_steps=10,
             eval_strategy="steps",
             eval_steps=50,
@@ -120,8 +224,13 @@ def main():
             seed=42,
             report_to="none",
             dataset_text_field="text",
-            max_seq_length=MAX_SEQ_LEN,
+            max_seq_length=effective_max_seq_len,
             packing=True,
+            # Windows + Unsloth compiled trainer can fail during multiprocessing
+            # tokenization with `ModuleNotFoundError: UnslothSFTTrainer`.
+            # Force single-process dataset preprocessing for stability.
+            dataset_num_proc=1,
+            dataloader_num_workers=0,
         ),
     )
 
